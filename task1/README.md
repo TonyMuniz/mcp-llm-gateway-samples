@@ -10,10 +10,9 @@ A Python MCP server (stdio transport, `mcp` SDK 2.3) exposing two tools:
 ## Setup and test (Debian / Linux)
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python test_stdio.py      # black-box JSON-RPC test over stdio (runs the server in 5 configurations)
-.venv/bin/python server.py          # run the server (speaks JSON-RPC on stdin/stdout)
+uv sync                          # creates .venv from pyproject.toml / uv.lock
+uv run python test_stdio.py      # black-box JSON-RPC test over stdio (runs the server in 5 configurations)
+uv run python server.py          # run the server (speaks JSON-RPC on stdin/stdout)
 ```
 
 stdout carries only JSON-RPC; all logs go to stderr.

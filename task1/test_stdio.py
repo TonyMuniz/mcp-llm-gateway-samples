@@ -1,7 +1,7 @@
 """Black-box test: spawns server.py several times with different per-process
 settings and speaks raw JSON-RPC over stdio.
 
-Run:  .venv/bin/python test_stdio.py      (Windows: .venv\\Scripts\\python test_stdio.py)
+Run:  uv run python test_stdio.py      (Windows: .venv\\Scripts\\python test_stdio.py)
 
 Phases: default (strict, audit off) / lenient / lenient+audit / strict+audit / bad env value.
 In every phase every stdout line must parse as JSON-RPC (stdout purity).
