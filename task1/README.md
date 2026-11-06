@@ -1,4 +1,4 @@
-# customer-mcp
+# Task 1: Build a Custom MCP Server with Strict Validation & Transport Handling
 
 A Python MCP server (stdio transport, `mcp` SDK 2.3) exposing two tools:
 
