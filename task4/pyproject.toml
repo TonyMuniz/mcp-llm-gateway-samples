@@ -1,0 +1,6 @@
+[project]
+name = "model-router"
+version = "0.1.0"
+description = "LLM gateway with token rate limiting and model fallback"
+requires-python = ">=3.11"
+dependencies = ["aiohttp>=3.9"]
