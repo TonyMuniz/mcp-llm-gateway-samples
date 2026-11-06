@@ -1,6 +1,6 @@
-# MCP Gateway
+# Task 2: Implement an MCP Security Gateway Proxy (Tool Filtering & Auth)
 
-A small reverse proxy (Python 3.13, aiohttp, managed with uv) that sits between an AI agent and a
+A small reverse proxy (Python 3.11+, developed and tested on 3.15.2; aiohttp; managed with uv) that sits between an AI agent and a
 downstream MCP server (streamable HTTP, JSON-RPC 2.0) and enforces role-based
 authorization on tool calls.
 
