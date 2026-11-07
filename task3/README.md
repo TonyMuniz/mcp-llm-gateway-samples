@@ -44,9 +44,9 @@ Tests: `uv run python -m unittest -v test_redactor test_gateway` (39 tests). Ben
 | Requirement | How it is met |
 |---|---|
 | Proxy endpoint that routes generation requests to a provider and streams the reply | `POST /v1/chat/completions` (OpenAI-compatible SSE), `--upstream` / `UPSTREAM_BASE_URL` |
-| Intercept the chunk stream in real time | Each SSE event is parsed, redacted and written as it arrives (see "How the streaming redaction works") |
-| Detect and redact emails, SSNs, card numbers as `[REDACTED]` | Plus ITINs, IBANs, UK NINOs, Canadian SINs and passport numbers (see "What is detected"), also when written with Unicode look-alike characters |
-| No full-response buffering; low TTFT and latency | Only the current word is held; memory is flat at about 42 MB; TTFT adds about one token interval (see "Measured") |
+| Intercept the chunk stream in real time | Each SSE event is parsed, redacted and written as it arrives (see ["How the streaming redaction works"](#how-the-streaming-redaction-works-redactorpy)) |
+| Detect and redact emails, SSNs, card numbers as `[REDACTED]` | Plus ITINs, IBANs, UK NINOs, Canadian SINs and passport numbers (see ["What is detected"](#what-is-detected)), also when written with Unicode look-alike characters |
+| No full-response buffering; low TTFT and latency | Only the current word is held; memory is flat at about 42 MB; TTFT adds about one token interval (see ["Measured"](#measured-orange-pi-5b-arm64-mock-provider-on-the-same-box)) |
 
 ## What is detected
 
@@ -87,7 +87,7 @@ look-behind window delays every character.
 The approach, per chunk:
 
 1. `buf = held_back + new_text` (with invisible characters removed), and a same-length folded copy
-   for matching (see "Unicode look-alikes" above)
+   for matching (see "Unicode look-alikes" [above](#what-is-detected))
 2. Choose a **cut**. Text before it is final; text after it is held back. The cut starts at the
    beginning of the trailing text that could still grow into a match (for most identifiers, the
    current word or digit run), and is then moved earlier if any *complete* match straddles it.

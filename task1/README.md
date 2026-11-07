@@ -29,10 +29,10 @@ black-box checks over raw JSON-RPC, running the server in 5 configurations).
 | Requirement | How it is met |
 |---|---|
 | Official SDK, two tools | `mcp` 2.3 (`MCPServer`), `get_customer_record` and `trigger_refund` |
-| Strict schema validation (Pydantic) | Pydantic types are both the published JSON Schema and the call-time check (see "customer_id formats" and the table above) |
+| Strict schema validation (Pydantic) | Pydantic types are both the published JSON Schema and the call-time check (see ["customer_id formats"](#customer_id-formats) and the [table above](#task-1-build-a-custom-mcp-server-with-strict-validation--transport-handling)) |
 | Reject invalid formats with standard JSON-RPC errors | `-32602` for bad arguments and unknown tools, `-32601` for unknown methods, `-32700` / `-32600` for lines that are not JSON-RPC (see "Errors") |
 | stdio transport, stdout reserved for JSON-RPC | No `print()`; logging to stderr only; the SDK also points fd 1 at stderr while serving; every test parses every stdout line as JSON-RPC |
-| Edge cases on malformed input | Wrong types, whitespace, trailing newlines, NaN/Infinity, booleans, decimals, control and invisible characters, invalid UTF-8 (see "Known issues and limits" for what remains) |
+| Edge cases on malformed input | Wrong types, whitespace, trailing newlines, NaN/Infinity, booleans, decimals, control and invisible characters, invalid UTF-8 (see ["Known issues and limits"](#known-issues-and-limits) for what remains) |
 
 ## Built-in test data
 
@@ -110,8 +110,8 @@ config with absolute paths connected. Do not rely on `~` or `$HOME` in these fie
 
 | Variable | Default | Effect |
 |---|---|---|
-| `CUSTOMER_MCP_LENIENT_IDS` | off | Accept shorthand customer ids (see below). |
-| `CUSTOMER_MCP_AUDIT_LOG` | off | Write an `audit` line to stderr per `customer_id` with the raw input (see below). |
+| `CUSTOMER_MCP_LENIENT_IDS` | off | Accept shorthand customer ids (see [below](#customer_mcp_lenient_ids1-read-this-before-enabling)). |
+| `CUSTOMER_MCP_AUDIT_LOG` | off | Write an `audit` line to stderr per `customer_id` with the raw input (see [below](#customer_mcp_audit_log1)). |
 
 Boolean values: `1/true/yes/on` or `0/false/no/off` (any case; unset or empty means off). **Any other
 value aborts startup** with a message on stderr, so a typo such as `ture` cannot silently disable

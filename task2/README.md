@@ -35,7 +35,7 @@ on real sockets).
 | Read the role from `Authorization: Bearer <token>` | `resolve_role()`: static token table, constant-time comparison; missing or unknown token is HTTP 401 |
 | `tools/list` forwarded transparently | Forwarded for every role (tested) |
 | `tools/call` on an `admin_` tool needs role `admin`, else `-32001` without calling downstream | `authorize()`; the downstream's request log is checked in the tests to prove nothing reached it |
-| Parse the JSON-RPC wire format correctly | Parse errors, batches, wrong `id` types, missing `params.name`, notifications (see "Behavior and errors") |
+| Parse the JSON-RPC wire format correctly | Parse errors, batches, wrong `id` types, missing `params.name`, notifications (see ["Behavior and errors"](#behavior-and-errors)) |
 
 ## Behavior and errors
 

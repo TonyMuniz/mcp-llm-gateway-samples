@@ -6,7 +6,7 @@ A gateway for chat-completion requests (Python 3.11+, developed and tested on 3.
 1. **Rate limits each tenant API key by tokens**: 50,000 tokens per sliding minute by default, state in
    an on-disk SQLite file.
 2. **Fails over** from the primary provider to a backup when the primary returns 429 or does not finish
-   within 3000 ms (plus other failures, see below), and **stops paying that wait on every request**: a
+   within 3000 ms (plus other failures, see [below](#failover-routerpy)), and **stops paying that wait on every request**: a
    per-provider circuit breaker skips a dead provider, retries it periodically, and fails back to it.
 3. **Never leaks internals**: every error is one standardized payload with a fixed message and a
    `request_id`; raw upstream bodies, stack traces and exception text never reach the client.
@@ -43,7 +43,7 @@ Tests: `uv run python -m unittest -v test_ratelimit test_gateway test_breaker` (
 | Requirement | How it is met |
 |---|---|
 | Routing module for completion requests | `router.py` (`ModelRouter`), wired into `gateway.py` at `POST /v1/chat/completions` |
-| Token-aware sliding window, 50,000 tokens/minute per tenant key | `ratelimit.py`: sliding window log with reserve, settle and release (see below) |
+| Token-aware sliding window, 50,000 tokens/minute per tenant key | `ratelimit.py`: sliding window log with reserve, settle and release (see [below](#token-aware-sliding-window-rate-limiter-ratelimitpy)) |
 | Fail over to a secondary on 429 or after 3000 ms | One `asyncio.timeout(3.0)` around the whole primary exchange; also fails over on connection errors and 5xx |
 | Standardized error payload, no stack traces or internals | `errors.py` plus one middleware; tested with providers that return stack traces and credentials |
 | On-disk SQLite | WAL-mode SQLite file (`--db`), state survives restarts (tested) |
