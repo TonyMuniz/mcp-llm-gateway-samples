@@ -21,8 +21,8 @@ uv sync                          # creates .venv from pyproject.toml / uv.lock
 uv run python server.py          # run the server (speaks JSON-RPC on stdin/stdout)
 ```
 
-stdout carries only JSON-RPC; all logs go to stderr. Tests: `uv run python test_stdio.py` (137
-black-box checks over raw JSON-RPC, running the server in 5 configurations).
+stdout carries only JSON-RPC; all logs go to stderr. Tests: `uv run python -m unittest -v test_stdio`
+(137 black-box checks over raw JSON-RPC, grouped as 5 tests: one per server configuration).
 
 ## Assignment requirements
 
@@ -82,7 +82,7 @@ environment variables.
 Caveat for negative tests: the Inspector converts argument values to the types in the tool's schema
 before sending, even with `--tool-args-json`. A string amount such as `"10"` therefore reaches the
 server as the number `10` and is accepted. To confirm what was really sent, check the Protocol tab
-(`p`) in the TUI. To test type rejection exactly, use `uv run python test_stdio.py`, which sends raw
+(`p`) in the TUI. To test type rejection exactly, use `uv run python -m unittest -v test_stdio`, which sends raw
 JSON-RPC.
 
 ## Per-process settings
@@ -284,4 +284,4 @@ One direct dependency, `mcp>=2.3,<2.4` (locked at 2.3.0 in `uv.lock`, with Pydan
 installs its HTTP transport packages (Starlette, uvicorn, `sse-starlette`, `python-multipart`, PyJWT),
 which this stdio-only server never imports. `uv audit` on 2026-11-07: no known vulnerabilities in the
 30 locked packages. Python 3.15 is pinned in `.python-version`; the tests also pass on 3.11 and 3.13.
-Upgrading the SDK is deliberate: bump the range, run `test_stdio.py`, commit.
+Upgrading the SDK is deliberate: bump the range, run the tests, commit.

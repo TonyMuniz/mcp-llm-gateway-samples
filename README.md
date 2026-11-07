@@ -20,13 +20,13 @@ Each folder is its own project with its own README, `pyproject.toml`, `uv.lock` 
 Run commands from inside the task's folder:
 
 ```bash
-cd task1
+cd task1                      # or task2, task3, task4
 uv sync                       # creates .venv from pyproject.toml / uv.lock
-uv run python test_stdio.py   # task1 test suite
+uv run python -m unittest -v  # runs that task's test suite
 ```
 
-For `task2` to `task4` the tests run with `uv run python -m unittest -v`. Each README lists the exact
-commands, the assignment requirements and where they are met, design decisions, and known issues and limits.
+Each README lists the exact commands, the assignment requirements and where they are met, design
+decisions, and known issues and limits.
 
 ## History
 
