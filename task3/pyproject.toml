@@ -3,4 +3,4 @@ name = "llm-gateway"
 version = "0.1.0"
 description = "LLM gateway with streaming PII redaction"
 requires-python = ">=3.11"
-dependencies = ["aiohttp>=3.9"]
+dependencies = ["aiohttp>=3.14.5"]

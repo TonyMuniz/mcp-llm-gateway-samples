@@ -40,6 +40,7 @@ SESSION = web.AppKey("session", ClientSession)
 
 META_KEYS = ("id", "object", "created", "model")
 DONE = b"data: [DONE]\n\n"
+MAX_BUFFERED_BYTES = 8 * 1024 * 1024  # cap for non-streamed upstream replies (same as Task 4)
 
 
 class UpstreamProtocolError(Exception):
@@ -71,13 +72,51 @@ def _redact_strings(value: Any) -> Any:
     return value
 
 
+def _redact_message(message: dict[str, Any]) -> None:
+    """Non-streaming ``choices[].message``: redact every text field and every tool-call argument string."""
+    for key, value in message.items():
+        if key != "role" and isinstance(value, str):
+            message[key] = redact_text(value)
+    for call in message.get("tool_calls") or []:
+        fn = call.get("function") if isinstance(call, dict) else None
+        if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+            fn["arguments"] = redact_text(fn["arguments"])
+
+
+async def _read_capped(upstream, limit: int = MAX_BUFFERED_BYTES) -> bytes | None:
+    """Read a whole (non-streamed) upstream body, or return None if it exceeds ``limit``."""
+    if (upstream.content_length or 0) > limit:
+        return None
+    chunks, size = [], 0
+    async for chunk in upstream.content.iter_chunked(64 * 1024):
+        size += len(chunk)
+        if size > limit:  # also enforced for chunked replies that send no Content-Length
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+# Redactor keys: (choice index, field name) for text fields such as "content", "refusal" or
+# "reasoning_content"; (choice index, "tool_calls", tool index) for tool-call argument strings.
+RedactorKey = tuple
+
+
 class StreamState:
-    """Per-request redaction state: one StreamRedactor per choice index."""
+    """Per-request redaction state: one StreamRedactor per choice and text field.
+
+    Every string field of a ``delta`` except ``role`` is redacted (content, refusal,
+    reasoning_content, and any text field a provider adds), and so are tool-call
+    ``arguments``. ``logprobs`` is dropped, because it repeats the generated tokens
+    one by one, unredacted.
+    """
 
     def __init__(self) -> None:
-        self.redactors: dict[int, StreamRedactor] = {}
+        self.redactors: dict[RedactorKey, StreamRedactor] = {}
         self.meta: dict[str, Any] = {}
         self.done = False
+
+    def _redactor(self, key: RedactorKey) -> StreamRedactor:
+        return self.redactors.setdefault(key, StreamRedactor())
 
     @property
     def redactions(self) -> int:
@@ -111,28 +150,62 @@ class StreamState:
         if not isinstance(choice, dict):
             raise UpstreamProtocolError("choice is not an object")
         idx = choice.get("index", 0)
-        redactor = self.redactors.setdefault(idx if isinstance(idx, int) else 0, StreamRedactor())
+        idx = idx if isinstance(idx, int) and not isinstance(idx, bool) else 0
+        if choice.get("logprobs") is not None:
+            choice["logprobs"] = None  # per-token text would bypass redaction
         delta = choice.get("delta")
         if delta is None:
             delta = {}
         elif not isinstance(delta, dict):
             raise UpstreamProtocolError("'delta' is not an object")
-        content = delta.get("content")
-        text = redactor.feed(content) if isinstance(content, str) else ""
+        for key, value in list(delta.items()):
+            if key != "role" and isinstance(value, str):
+                delta[key] = self._redactor((idx, key)).feed(value)
+        calls = delta.get("tool_calls")
+        if calls is not None and not isinstance(calls, list):
+            raise UpstreamProtocolError("'tool_calls' is not a list")
+        for call in calls or []:
+            fn = call.get("function") if isinstance(call, dict) else None
+            if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                fn["arguments"] = self._redactor((idx, "tool_calls", call.get("index", 0))).feed(fn["arguments"])
         if choice.get("finish_reason") is not None:
-            text += redactor.flush()  # release held text before the finish marker goes out
-        if isinstance(content, str) or text:
-            delta["content"] = text
+            # Release held text into this event, before the finish marker goes out.
+            for key, text in self._flush_choice(idx):
+                self._place(delta, key, text)
+        if delta:
             choice["delta"] = delta
+
+    def _flush_choice(self, idx: int) -> list[tuple[RedactorKey, str]]:
+        out = []
+        for key, redactor in self.redactors.items():
+            if key[0] == idx and (text := redactor.flush()):
+                out.append((key, text))
+        return out
+
+    @staticmethod
+    def _place(delta: dict[str, Any], key: RedactorKey, text: str) -> None:
+        """Append flushed ``text`` to the field of ``delta`` that ``key`` names."""
+        if len(key) == 2:
+            existing = delta.get(key[1])
+            delta[key[1]] = (existing if isinstance(existing, str) else "") + text
+            return
+        calls = delta.setdefault("tool_calls", [])
+        for call in calls:
+            if isinstance(call, dict) and call.get("index", 0) == key[2] and isinstance(call.get("function"), dict):
+                fn = call["function"]
+                fn["arguments"] = (fn.get("arguments") if isinstance(fn.get("arguments"), str) else "") + text
+                return
+        calls.append({"index": key[2], "function": {"arguments": text}})
 
     def flush_all(self) -> bytes:
         """Emit held-back text as synthetic chunks (used at [DONE] or an early end)."""
         out = b""
-        for idx, redactor in self.redactors.items():
-            text = redactor.flush()
-            if text:
-                chunk = {**self.meta, "choices": [{"index": idx, "delta": {"content": text},
-                                                   "finish_reason": None}]}
+        for idx in sorted({key[0] for key in self.redactors}):
+            delta: dict[str, Any] = {}
+            for key, text in self._flush_choice(idx):
+                self._place(delta, key, text)
+            if delta:
+                chunk = {**self.meta, "choices": [{"index": idx, "delta": delta, "finish_reason": None}]}
                 out += _sse_json(chunk)
         return out
 
@@ -142,7 +215,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     body = await request.read()
     try:
         payload = json.loads(body)
-    except ValueError:
+    except (ValueError, RecursionError):  # ValueError includes undecodable bytes; RecursionError is deep nesting
         return _error_json(400, "request body is not valid JSON", "invalid_request")
     if not isinstance(payload, dict):
         return _error_json(400, "request body must be a JSON object", "invalid_request")
@@ -156,7 +229,7 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     try:
         async with app[SESSION].post(app[UPSTREAM] + "/v1/chat/completions",
                                      data=body, headers=headers) as upstream:
-            ctype = upstream.headers.get("Content-Type", "")
+            ctype = upstream.headers.get("Content-Type", "").lower()  # media types are case-insensitive
             if upstream.status == 200 and ctype.startswith("text/event-stream"):
                 return await _stream(request, upstream, started)
             return await _buffered(upstream)
@@ -166,9 +239,10 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
 
 
 async def _buffered(upstream) -> web.Response:
-    """Non-streaming reply (or an upstream error): small, so read it whole."""
-    raw = await upstream.read()
-    ctype = upstream.headers.get("Content-Type", "application/json")
+    """Non-streaming reply (or an upstream error): read it whole, up to ``MAX_BUFFERED_BYTES``."""
+    raw = await _read_capped(upstream)
+    if raw is None:
+        return _error_json(502, "upstream response is too large", "upstream_response_too_large")
     if upstream.status != 200:
         # The provider's own error: keep its status and shape, but redact every string in it
         # (error messages often echo the offending input).
@@ -181,9 +255,11 @@ async def _buffered(upstream) -> web.Response:
     try:
         obj = json.loads(raw)
         for choice in obj.get("choices") or []:
+            if choice.get("logprobs") is not None:
+                choice["logprobs"] = None  # per-token text would bypass redaction
             message = choice.get("message")
-            if isinstance(message, dict) and isinstance(message.get("content"), str):
-                message["content"] = redact_text(message["content"])
+            if isinstance(message, dict):
+                _redact_message(message)
     except (ValueError, AttributeError, TypeError, RecursionError):
         return _error_json(502, "upstream returned an unparseable response", "invalid_upstream_response")
     return web.json_response(obj)

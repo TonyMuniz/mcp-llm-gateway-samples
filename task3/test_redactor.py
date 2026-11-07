@@ -59,7 +59,7 @@ class RedactionTests(unittest.TestCase):
                   "bob@example.com", "carol_9@sub.domain.org", "123-45-6789", "078-05-1120",
                   "4111111111111111", "4111 1111 1111 1111", "1234-5678-9012-3456", "12345",
                   "@", "user@", "@host.com", "v1.2.3", "123-45-6789world",
-                  "9 9 9 9 9 9 9 9 9 9 9 9 9 9x", "100%", "+1", "\n", "é", "日本",
+                  "9 9 9 9 9 9 9 9 9 9 9 9 9 9x", "100%", "+1", "\n", "\u00e9", "\u65e5\u672c",
                   # newer identifiers, valid and invalid forms, plus look-alikes and partial context
                   "GB82 WEST 1234 5698 7654 32", "GB83 WEST 1234 5698 7654 32", "GB82WEST12345698765432",
                   "DE89 3704 0044 0532 0130 00", "GB82", "AB", "OK", "US",
@@ -138,6 +138,50 @@ class DetectorTests(unittest.TestCase):
         r = StreamRedactor()
         out = r.feed("my passport number: ") + r.feed("X1234") + r.feed("567 thanks") + r.flush()
         self.assertEqual(out, "my passport number: [REDACTED] thanks")
+
+
+class UnicodeTests(unittest.TestCase):
+    """Look-alike characters must not hide an identifier (they did before the folding step)."""
+
+    VARIANTS = {
+        "fullwidth digits": "SSN \uff11\uff12\uff13-\uff14\uff15-\uff16\uff17\uff18\uff19 end",
+        "Arabic-Indic digits": "SSN \u0661\u0662\u0663-\u0664\u0665-\u0666\u0667\u0668\u0669 end",
+        "non-breaking hyphen": "SSN 123\u201145\u20116789 end",
+        "en dash": "SSN 123\u201345\u20136789 end",
+        "minus sign": "SSN 123\u221245\u22126789 end",
+        "no-break space card": "card 4111\u00a01111\u00a01111\u00a01111 end",
+        "narrow no-break space card": "card 4111\u202f1111\u202f1111\u202f1111 end",
+        "zero-width space inside": "SSN 123-45\u200b-6789 end",
+        "soft hyphen inside": "card 4111\u00ad1111 1111 1111 end",
+        "fullwidth at sign": "mail bob\uff20example.com end",
+        "accented local part": "mail jos\u00e9@example.com end",
+        "accented domain": "mail bob@ex\u00e4mple.com end",
+        "fullwidth passport keyword": "\uff50\uff41\uff53\uff53\uff50\uff4f\uff52\uff54 X1234567 end",
+    }
+
+    def test_look_alikes_are_redacted_one_shot_and_streamed(self):
+        for label, text in self.VARIANTS.items():
+            out = redact_text(text)
+            self.assertIn(REDACTED, out, label)
+            self.assertTrue(out.endswith(" end"), (label, out))
+            for size in (1, 2, 3, 5):
+                self.assertEqual(stream(text, [size]), out, f"{label} size {size}")
+
+    def test_invisible_characters_are_removed_and_other_text_is_untouched(self):
+        self.assertEqual(redact_text("a\u200bb\u202ec\ufeffd"), "abcd")
+        plain = "Caf\u00e9 \u65e5\u672c \U0001F600 na\u00efve \u2014 fine"
+        self.assertEqual(redact_text(plain), plain)
+        self.assertEqual(stream(plain, [1]), plain)
+
+    def test_fuzz_with_unicode_look_alikes(self):
+        rng = random.Random(4321)
+        pieces = ["hello", "123-45-6789", "\uff11\uff12\uff13", "-", "\u2011", "\u00a0", "\u202f", "\u200b",
+                  "4111", "1111", "bob", "@", "\uff20", "example.com", "jos\u00e9", "\u00e9", "\u65e5",
+                  "passport", "X1234567", "GB82", "WEST", "\u0661\u0662", " ", "\n"]
+        for _ in range(3000):
+            text = "".join(rng.choice(pieces) + rng.choice([" ", "", "\u00a0"]) for _ in range(rng.randint(1, 25)))
+            sizes = [rng.randint(1, 9) for _ in range(rng.randint(1, 5))]
+            self.assertEqual(stream(text, sizes), redact_text(text), f"{text!r} sizes={sizes}")
 
 
 class LatencyAndMemoryTests(unittest.TestCase):

@@ -127,10 +127,12 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("bob@example.com", json.dumps([e for _, e in events]))
 
     async def test_bad_request_body(self):
-        async with self.http.post(self.url, data="{nope", headers={"Content-Type": "application/json"}) as r:
-            self.assertEqual(r.status, 400)
-            err = (await r.json())["error"]
-        self.assertEqual((err["type"], err["code"]), ("gateway_error", "invalid_request"))
+        deep = "[" * 100_000 + "]" * 100_000  # used to be an unhandled RecursionError (HTTP 500)
+        for body in ("{nope", '{"model":"m","messages":' + deep + "}", b"\xff\xfe{"):
+            async with self.http.post(self.url, data=body, headers={"Content-Type": "application/json"}) as r:
+                self.assertEqual(r.status, 400, body[:10])
+                err = (await r.json())["error"]
+            self.assertEqual((err["type"], err["code"]), ("gateway_error", "invalid_request"))
 
     async def test_provider_down_gives_502_with_code(self):
         await self.provider.close()
@@ -153,6 +155,43 @@ class StreamStateTests(unittest.TestCase):
         self.assertNotIn(b"a@b.com", out)
         self.assertNotIn(b"123-45-6789", out)
         self.assertEqual(out.count(b"[REDACTED]"), 2)
+
+    @staticmethod
+    def _events(out: bytes):
+        return [json.loads(line[6:]) for line in out.decode().split("\n") if line.startswith("data: {")]
+
+    def test_other_text_fields_tool_arguments_and_logprobs_are_covered(self):
+        s = gateway.StreamState()
+
+        def ev(delta, finish=None, **extra):
+            return json.dumps({"id": "x", "choices": [{"index": 0, "delta": delta, "finish_reason": finish, **extra}]})
+        out = b"".join([
+            s.process(ev({"role": "assistant", "reasoning_content": "user is bob@exa"})),
+            s.process(ev({"reasoning_content": "mple.com ok", "refusal": "SSN 123-45-6789 "})),
+            s.process(ev({"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "f", "arguments": '{"ssn":"123-45'}}]})),
+            s.process(ev({"tool_calls": [{"index": 0, "function": {"arguments": '-6789"}'}}]})),
+            s.process(ev({"content": "card 4111 1111 1111 1111"},
+                         logprobs={"content": [{"token": "4111", "logprob": 0.0}]})),
+            s.process(ev({}, "stop")),
+        ])
+        text = out.decode()
+        for secret in ("bob@example.com", "123-45-6789", "4111"):
+            self.assertNotIn(secret, text)
+        events = self._events(out)
+        self.assertTrue(all(c.get("logprobs") is None for e in events for c in e["choices"]))
+        args = "".join(c["delta"].get("tool_calls", [{}])[0].get("function", {}).get("arguments", "")
+                       for e in events for c in e["choices"])
+        self.assertEqual(json.loads(args), {"ssn": "[REDACTED]"})  # still valid JSON after redaction
+        self.assertEqual(events[0]["choices"][0]["delta"]["role"], "assistant")
+
+    def test_held_tool_arguments_are_released_at_done(self):
+        s = gateway.StreamState()
+        out = s.process(json.dumps({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 2, "function": {"arguments": '{"to":"bob@example.com'}}]}}]})) + s.process("[DONE]")
+        args = "".join(c["delta"]["tool_calls"][0]["function"]["arguments"]
+                       for e in self._events(out) for c in e["choices"] if c["delta"].get("tool_calls"))
+        self.assertEqual(args, '{"to":"[REDACTED]')
+        self.assertTrue(out.endswith(gateway.DONE))
 
     def test_non_object_event_is_a_protocol_error(self):
         for bad in ("[1]", '"x"', "nope"):

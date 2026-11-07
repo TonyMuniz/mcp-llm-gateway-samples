@@ -24,16 +24,37 @@ current "word" (or the in-progress identifier), so added latency is roughly one
 token interval, and memory per stream is bounded: ``pending`` never exceeds
 ``MAX_PENDING`` characters however long the response is.
 
+Unicode look-alikes: model output is not always plain ASCII. Before scanning, the
+text goes through two steps that keep streamed and one-shot output identical:
+
+* Invisible format characters (zero-width spaces and joiners, soft hyphens,
+  bidirectional controls, BOM) are **removed** from the output. They render as
+  nothing, so they could otherwise split an identifier ("123-45<ZWSP>-6789")
+  and hide it from the patterns.
+* Detection runs on a *folded* copy in which each look-alike character is mapped
+  to its ASCII equivalent, one character for one character: any Unicode decimal
+  digit (fullwidth, Arabic-Indic, ...) to 0-9, Unicode dashes and minus signs to
+  "-", Unicode spaces (no-break, narrow, figure, ...) to " ", and other single
+  characters whose NFKC form is one ASCII character (fullwidth letters, "\uff20").
+  Because the copy has the same length, match positions apply unchanged to the
+  real text, and only the real text is ever sent.
+
 Adding an identifier: append a ``Detector`` to ``DETECTORS``; see its docstring.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Callable
 
 REDACTED = "[REDACTED]"
+
+# Latin letters with diacritics (U+00C0 to U+024F), accepted in email local parts and
+# domain labels so that "josé@example.com" is caught. Wider scripts are out of scope.
+_LATIN_EXT = "\u00c0-\u024f"
 
 # Longest tail we hold back looking for an identifier in progress. An RFC 5321
 # address is at most 254 characters, so this covers any real email; it only
@@ -98,8 +119,8 @@ class Detector:
 
 DETECTORS: tuple[Detector, ...] = (
     Detector("email", (
-        r"[A-Za-z0-9_.%+\-]{1,64}@"
-        r"[A-Za-z0-9\-]{1,63}(?:\.[A-Za-z0-9\-]{1,63}){0,8}\.[A-Za-z]{2,24}"
+        rf"[A-Za-z0-9_.%+\-{_LATIN_EXT}]{{1,64}}@"
+        rf"[A-Za-z0-9\-{_LATIN_EXT}]{{1,63}}(?:\.[A-Za-z0-9\-{_LATIN_EXT}]{{1,63}}){{0,8}}\.[A-Za-z]{{2,24}}"
     )),
     # 13-19 digits, single space/hyphen separators. No Luhn on purpose (errs toward redaction).
     Detector("card", r"\b(?:\d[ \-]?){12,18}\d\b"),
@@ -133,16 +154,46 @@ _PATTERN = re.compile("|".join(f"(?P<{d.name}>{d.pattern})" for d in DETECTORS),
 #   - each detector's own ``tail``
 # \Z (not $) so a trailing newline does not count as "end of run".
 _TAIL = re.compile("|".join(
-    [r"[A-Za-z0-9_.%+@\-]+\Z", r"(?<![A-Za-z0-9_])\d[\d \-]*\Z"]
+    [rf"[A-Za-z0-9_.%+@\-{_LATIN_EXT}]+\Z", r"(?<![A-Za-z0-9_])\d[\d \-]*\Z"]
     + [d.tail for d in DETECTORS if d.tail]
 ), re.ASCII)
+
+
+# ---------------------------------------------------------------- Unicode handling
+
+# Removed from the output: zero-width and invisible formatting characters, bidi controls, BOM.
+_INVISIBLE = re.compile("[\u00ad\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]")
+_DASHES = frozenset("\u2010\u2011\u2012\u2013\u2014\u2015\u2043\u2212\ufe58\ufe63\uff0d")
+
+
+@lru_cache(maxsize=4096)
+def _fold_char(ch: str) -> str:
+    """One character in, one character out: the ASCII look-alike used for detection."""
+    if ch in _DASHES:
+        return "-"
+    if unicodedata.category(ch) == "Zs":  # every Unicode space separator, including no-break spaces
+        return " "
+    digit = unicodedata.decimal(ch, None)
+    if digit is not None:
+        return str(digit)
+    folded = unicodedata.normalize("NFKC", ch)
+    return folded if len(folded) == 1 and folded.isascii() else ch
+
+
+def strip_invisible(text: str) -> str:
+    return text if text.isascii() else _INVISIBLE.sub("", text)
+
+
+def fold(text: str) -> str:
+    """Same-length ASCII-folded copy of ``text``, used only for matching."""
+    return text if text.isascii() else "".join(map(_fold_char, text))
 
 
 # ---------------------------------------------------------------- engine
 
 def tail_start(text: str) -> int:
     """Index where a possibly-incomplete identifier at the end of ``text`` starts
-    (``len(text)`` if nothing needs holding back)."""
+    (``len(text)`` if nothing needs holding back). Expects folded text."""
     window = text[-MAX_HOLD:]
     m = _TAIL.search(window)
     return len(text) - len(window) + m.start() if m else len(text)
@@ -172,7 +223,8 @@ def _apply(buf: str, spans: list[tuple[int, int]], end: int) -> tuple[str, int]:
 
 def redact_text(text: str) -> str:
     """Redact a complete string in one shot (non-streaming responses)."""
-    spans = [s for m in _PATTERN.finditer(text) if (s := _span(m))]
+    text = strip_invisible(text)
+    spans = [s for m in _PATTERN.finditer(fold(text)) if (s := _span(m))]
     return _apply(text, spans, len(text))[0]
 
 
@@ -191,10 +243,11 @@ class StreamRedactor:
 
     def feed(self, text: str) -> str:
         """Add a delta; return the text that is now safe to send (may be empty)."""
-        buf = self._pending + text
-        cut = tail_start(buf)
+        buf = self._pending + strip_invisible(text)
+        scan = fold(buf)  # same length as buf: positions found in scan apply to buf
+        cut = tail_start(scan)
         spans = []
-        for m in _PATTERN.finditer(buf):
+        for m in _PATTERN.finditer(scan):
             if m.start() < cut < m.end():  # a complete match straddles the cut: hold all of it
                 cut = m.start()
             if span := _span(m):
@@ -209,7 +262,7 @@ class StreamRedactor:
     def flush(self) -> str:
         """End of stream: release whatever is still held back."""
         buf, self._pending = self._pending, ""
-        spans = [s for m in _PATTERN.finditer(buf) if (s := _span(m))]
+        spans = [s for m in _PATTERN.finditer(fold(buf)) if (s := _span(m))]
         out, n = _apply(buf, spans, len(buf))
         self.redactions += n
         return out
