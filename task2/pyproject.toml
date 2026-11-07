@@ -3,4 +3,4 @@ name = "mcp-gateway"
 version = "0.1.0"
 description = "Authorizing reverse proxy for MCP over HTTP"
 requires-python = ">=3.11"
-dependencies = ["aiohttp>=3.9"]
+dependencies = ["aiohttp>=3.14.5"]

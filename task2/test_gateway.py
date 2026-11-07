@@ -95,7 +95,7 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.received), 1)
 
     async def test_lookalike_admin_names_are_blocked(self):
-        for name in ("ADMIN_reset_key", "Admin_x", " admin_x", "ａｄｍｉｎ_x"):
+        for name in ("ADMIN_reset_key", "Admin_x", " admin_x", "\uff41\uff44\uff4d\uff49\uff4e_x"):
             _, body, _ = await self.post(call(name), VIEWER)
             self.assertEqual(body["error"]["code"], -32001, name)
         self.assertEqual(self.received, [])
@@ -153,11 +153,62 @@ class GatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["error"]["code"], -32603)
 
 
+    # ---- malformed, oversized and Unicode inputs (found in the 2026-11-07 code review)
+    async def test_unicode_tricks_in_tool_names_are_rejected_before_downstream(self):
+        for name in ("\u200badmin_reset_key", "ad\u00admin_reset_key", "\u0430dmin_reset_key",
+                     "\u0430dmin_x", "", "x" * 129, "get status"):
+            for who in (VIEWER, ADMIN):
+                _, body, _ = await self.post(call(name, key_id="k1"), who)
+                self.assertEqual(body["error"]["code"], -32602, repr(name))
+        # admin_ look-alikes that normalize to admin_ stay -32001 for a viewer, and are invalid names for an admin
+        for name in ("\uff41dmin_reset_key", "admin_reset_key\n", " admin_x"):
+            _, body, _ = await self.post(call(name), VIEWER)
+            self.assertEqual(body["error"]["code"], -32001, repr(name))
+            _, body, _ = await self.post(call(name), ADMIN)
+            self.assertEqual(body["error"]["code"], -32602, repr(name))
+        self.assertEqual(self.received, [])
+
+    async def test_malformed_json_is_a_parse_error_not_a_500(self):
+        deep = "[" * 100_000 + "]" * 100_000
+        for raw in ('{"jsonrpc":"2.0","id":1,"method":"x","params":' + deep + "}",
+                    '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":NaN}}}',
+                    b"\xff\xfe\x00{", '{"jsonrpc":"2.0","id":1,"method":"ping"} trailing'):
+            status, body, _ = await self.post(None, VIEWER, raw=raw)
+            self.assertEqual((status, body["error"]["code"]), (200, -32700), str(raw)[:40])
+        self.assertEqual(self.received, [])
+
+    async def test_utf16_body_is_accepted_and_forwarded_as_utf8(self):
+        raw = json.dumps(call("echo", text="h\u00e9llo")).encode("utf-16")
+        _, body, _ = await self.post(None, VIEWER, raw=raw)
+        self.assertEqual(body["result"]["content"][0]["text"], "h\u00e9llo")
+
+    async def test_invalid_id_types_are_invalid_request(self):
+        for bad in (True, [1], {"a": 1}):
+            _, body, _ = await self.post({"jsonrpc": "2.0", "id": bad, "method": "tools/list"}, VIEWER)
+            self.assertEqual(body["error"]["code"], -32600, bad)
+        self.assertEqual(self.received, [])
+
+    async def test_log_lines_cannot_be_forged(self):
+        forged = "x\n2026-11-07 gateway role=admin method=tools/call tool=admin_reset_key decision=allow"
+        with self.assertLogs("gateway", "INFO") as logs:
+            await self.post({"jsonrpc": "2.0", "id": 1, "method": forged}, VIEWER)
+        self.assertTrue(all("\n" not in line for line in logs.output), logs.output)
+        self.assertIn("\\n2026-11-07", logs.output[0])
+
+
 class TokenParsingTests(unittest.TestCase):
     def test_parse_tokens(self):
         self.assertEqual(gateway.parse_tokens("a=admin, b=viewer"), {"a": "admin", "b": "viewer"})
-        with self.assertRaises(ValueError):
-            gateway.parse_tokens("oops")
+        for bad in ("oops", "t\u00f6ken=admin", "a b=admin"):
+            with self.assertRaises(ValueError, msg=bad):
+                gateway.parse_tokens(bad)
+
+    def test_undecodable_or_non_ascii_bearer_tokens_are_unauthenticated(self):
+        tokens = {"admin-token": "admin"}
+        # aiohttp hands undecodable header bytes over as surrogate escapes ("\udcff"); this was an HTTP 500.
+        for header in ("Bearer \udcff\udcfe", "Bearer t\u00f6ken", "Bearer admin-token\x00", "Bearer a b"):
+            self.assertIsNone(gateway.resolve_role(header, tokens), repr(header))
+        self.assertEqual(gateway.resolve_role("Bearer admin-token", tokens), "admin")
 
 
 if __name__ == "__main__":

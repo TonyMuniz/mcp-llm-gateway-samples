@@ -23,6 +23,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import unicodedata
 from typing import Any
 
@@ -43,6 +44,14 @@ UNAUTHORIZED_TOOL_CALL = -32001
 
 ADMIN_PREFIX = "admin_"
 ADMIN_ROLE = "admin"
+
+# RFC 6750 "b64token": the only characters a Bearer token may contain. Anything else
+# (non-ASCII, control characters, undecodable bytes) is rejected before any comparison.
+BEARER_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
+# Tool names: ASCII letters, digits, "_", "-", "." and "/", 1 to 128 characters (in line with
+# the MCP tool-name guidance). Deny by default: zero-width characters, look-alike letters and
+# other Unicode tricks never reach the admin_ check or the downstream server.
+TOOL_NAME = re.compile(r"[A-Za-z0-9_\-./]{1,128}")
 
 # Demo tokens. Override with env GATEWAY_TOKENS="tokenA=admin,tokenB=viewer".
 DEFAULT_TOKENS = {"admin-token": "admin", "viewer-token": "viewer"}
@@ -74,9 +83,12 @@ def parse_tokens(spec: str) -> dict[str, str]:
         if not item:
             continue
         token, sep, role = item.partition("=")
+        token = token.strip()
         if not sep or not token or not role:
             raise ValueError(f"bad token entry {item!r}; expected token=role")
-        tokens[token.strip()] = role.strip()
+        if not BEARER_TOKEN.fullmatch(token):  # such a token could never be presented
+            raise ValueError("bad token entry: tokens may use only A-Z a-z 0-9 - . _ ~ + / and trailing =")
+        tokens[token] = role.strip()
     return tokens
 
 
@@ -90,8 +102,8 @@ def resolve_role(auth_header: str | None, tokens: dict[str, str]) -> str | None:
         return None
     scheme, _, token = auth_header.strip().partition(" ")
     token = token.strip()
-    if scheme.lower() != "bearer" or not token:
-        return None
+    if scheme.lower() != "bearer" or not BEARER_TOKEN.fullmatch(token):
+        return None  # also keeps undecodable header bytes away from .encode() (was an HTTP 500)
     found: str | None = None
     for known, role in tokens.items():  # compare against all, in constant time per entry
         if hmac.compare_digest(known.encode(), token.encode()):
@@ -101,13 +113,23 @@ def resolve_role(auth_header: str | None, tokens: dict[str, str]) -> str | None:
 
 # ---------------------------------------------------------------- JSON-RPC helpers
 
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def _valid_id(req_id: Any) -> bool:
+    """JSON-RPC ids are strings, numbers or null (and never booleans)."""
+    return req_id is None or (isinstance(req_id, (str, int, float)) and not isinstance(req_id, bool))
+
+
 def rpc_error(req_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
 def is_admin_tool(name: str) -> bool:
-    # NFKC + casefold so look-alikes such as "ADMIN_x" or fullwidth "ａｄｍｉｎ_x"
-    # cannot slip past a downstream that is more lenient than we are.
+    # Case-insensitive, so "ADMIN_x" cannot slip past a downstream that is more lenient
+    # than we are. TOOL_NAME already limits names to ASCII; NFKC stays as a second layer
+    # (fullwidth "ａｄｍｉｎ_x") in case that allow-list is ever widened.
     normalized = unicodedata.normalize("NFKC", name).strip().casefold()
     return normalized.startswith(ADMIN_PREFIX)
 
@@ -121,8 +143,10 @@ def authorize(msg: dict[str, Any], role: str) -> dict[str, Any] | None:
     name = params.get("name") if isinstance(params, dict) else None
     if not isinstance(name, str):
         return rpc_error(req_id, INVALID_PARAMS, "tools/call requires params.name (string)")
-    if is_admin_tool(name) and role != ADMIN_ROLE:
+    if is_admin_tool(name) and role != ADMIN_ROLE:  # first, so admin look-alikes still read as -32001
         return rpc_error(req_id, UNAUTHORIZED_TOOL_CALL, "Unauthorized Tool Call")
+    if not TOOL_NAME.fullmatch(name):
+        return rpc_error(req_id, INVALID_PARAMS, "Invalid tool name")
     return None
 
 
@@ -143,19 +167,24 @@ async def handle(request: web.Request) -> web.StreamResponse:
     if request.method == "POST":
         raw = await request.read()
         try:
-            msg = json.loads(raw)
-        except (ValueError, UnicodeDecodeError):
+            # json.loads accepts UTF-8 (with or without BOM), UTF-16 and UTF-32 bytes; the
+            # re-serialized body below is always plain UTF-8/ASCII. NaN and Infinity are not
+            # JSON, so they are refused rather than forwarded to a stricter downstream parser.
+            msg = json.loads(raw, parse_constant=_reject_constant)
+        except (ValueError, RecursionError):  # ValueError covers undecodable bytes; deep nesting -> RecursionError
             return web.json_response(rpc_error(None, PARSE_ERROR, "Parse error"))
         if isinstance(msg, list):
             # MCP (2025-06-18) dropped JSON-RPC batching; refusing is safer than
             # forwarding sub-requests we have not individually authorized.
             return web.json_response(rpc_error(None, INVALID_REQUEST, "Batch requests are not supported"))
-        if not isinstance(msg, dict) or ("method" in msg and not isinstance(msg["method"], str)):
+        if not isinstance(msg, dict) or ("method" in msg and not isinstance(msg["method"], str)) \
+                or not _valid_id(msg.get("id")):
             return web.json_response(rpc_error(None, INVALID_REQUEST, "Invalid Request"))
 
         req_id = msg.get("id")
         denial = authorize(msg, role)
-        log.info("role=%s method=%s tool=%s decision=%s", role, msg.get("method"),
+        # %a (ascii()) escapes newlines and non-ASCII, so a caller cannot forge log lines.
+        log.info("role=%s method=%a tool=%a decision=%s", role, msg.get("method"),
                  (msg.get("params") or {}).get("name") if isinstance(msg.get("params"), dict) else None,
                  "deny" if denial else "allow")
         if denial is not None:
@@ -166,7 +195,7 @@ async def handle(request: web.Request) -> web.StreamResponse:
         # Forward what we *parsed and checked*, not the raw bytes. This closes
         # parser-differential tricks such as duplicate "name" keys, where we
         # and the downstream might pick different values.
-        body = json.dumps(msg).encode()
+        body = json.dumps(msg, allow_nan=False).encode()
 
     return await forward(request, body, req_id)
 
