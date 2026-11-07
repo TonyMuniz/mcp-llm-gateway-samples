@@ -223,7 +223,7 @@ database URL with a password and a GPU hostname, then checks none of it appears.
 - **Breaker state is per process and in memory.** With several gateway processes each learns separately.
   While a circuit is open, one request per cooldown (the trial) can still pay the primary's timeout, unless
   an active probe has already shown it healthy. If all providers are down, a request that wins a
-  last-resort slot waits out the timeouts (3 s + 10 s); concurrent ones fail fast (see the DoS section).
+  last-resort slot waits out the timeouts (3 s + 10 s); concurrent ones fail fast (see the [DoS section](#denial-of-service-posture)).
 - **Wall-clock timestamps** are used (not monotonic) so usage stays meaningful across restarts; a large
   clock jump would skew windows.
 - **A late completion** (a request that outlives the window) is recorded at completion time.
