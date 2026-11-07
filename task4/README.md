@@ -205,7 +205,7 @@ database URL with a password and a GPU hostname, then checks none of it appears.
 - **Non-streaming only.** Once a streamed response has started, failing over mid-way is not possible, so
   `stream: true` is rejected with a clear error rather than half-supported.
 - **API keys are validated against the RFC 6750 token alphabet** before any comparison (same rule as
-  Task 2), and `GATEWAY_API_KEYS` entries outside it abort startup.
+  [Task 2](../task2/README.md)), and `GATEWAY_API_KEYS` entries outside it abort startup.
 - **The request body is re-serialized** (`json.dumps`) before it goes to a provider, so the provider
   always receives UTF-8 JSON, whatever encoding the client used.
 
@@ -233,7 +233,7 @@ database URL with a password and a GPU hostname, then checks none of it appears.
   failures. The cap is enforced while reading, so it also holds for chunked replies without a
   `Content-Length` (before the review those were read whole first).
 - **The provider's success body is passed through as is.** Only errors are rewritten; the content of a
-  200 reply is the provider's (see Task 3 for redacting it).
+  200 reply is the provider's (see [Task 3](../task3/README.md) for redacting it).
 
 ## Dependencies and security
 
