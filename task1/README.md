@@ -1,21 +1,38 @@
 # Task 1: Build a Custom MCP Server with Strict Validation & Transport Handling
 
-A Python MCP server (stdio transport, `mcp` SDK 2.3) exposing two tools:
+An MCP server (Python 3.11+, developed and tested on 3.15.2; official `mcp` SDK 2.3 with Pydantic;
+managed with uv) that speaks JSON-RPC over stdio and exposes two tools:
 
 | Tool | Arguments |
 |---|---|
 | `get_customer_record` | `customer_id` |
 | `trigger_refund` | `customer_id`, `amount` (> 0, max 10000, 2 decimals), `reason` (10 to 500 chars) |
 
-## Setup and test (Debian / Linux)
+```
+MCP client --JSON-RPC on stdin--> server.py --JSON-RPC on stdout--> MCP client
+                                      |
+                                      +--> logs on stderr only
+```
+
+## Run
 
 ```bash
 uv sync                          # creates .venv from pyproject.toml / uv.lock
-uv run python test_stdio.py      # black-box JSON-RPC test over stdio (runs the server in 5 configurations)
 uv run python server.py          # run the server (speaks JSON-RPC on stdin/stdout)
 ```
 
-stdout carries only JSON-RPC; all logs go to stderr.
+stdout carries only JSON-RPC; all logs go to stderr. Tests: `uv run python test_stdio.py` (137
+black-box checks over raw JSON-RPC, running the server in 5 configurations).
+
+## Assignment requirements
+
+| Requirement | How it is met |
+|---|---|
+| Official SDK, two tools | `mcp` 2.3 (`MCPServer`), `get_customer_record` and `trigger_refund` |
+| Strict schema validation (Pydantic) | Pydantic types are both the published JSON Schema and the call-time check (see "customer_id formats" and the table above) |
+| Reject invalid formats with standard JSON-RPC errors | `-32602` for bad arguments and unknown tools, `-32601` for unknown methods, `-32700` / `-32600` for lines that are not JSON-RPC (see "Errors") |
+| stdio transport, stdout reserved for JSON-RPC | No `print()`; logging to stderr only; the SDK also points fd 1 at stderr while serving; every test parses every stdout line as JSON-RPC |
+| Edge cases on malformed input | Wrong types, whitespace, trailing newlines, NaN/Infinity, booleans, decimals, control and invisible characters, invalid UTF-8 (see "Known issues and limits" for what remains) |
 
 ## Built-in test data
 
@@ -101,8 +118,12 @@ value aborts startup** with a message on stderr, so a typo such as `ture` cannot
 auditing. The server logs its effective settings on startup:
 `Starting customer-mcp on stdio (lenient_ids=False audit_log=False)`.
 
-## Error model
+## Errors
 
+- A line that is not valid JSON (garbage, truncated, a UTF-8 BOM, UTF-16 text, a lone surrogate
+  escape, nesting too deep): `-32700` (Parse error) with `"id": null`. Valid JSON that is not a
+  JSON-RPC message: `-32600` (Invalid Request). The SDK alone drops such lines silently, which leaves
+  a client waiting forever; `StrictMCPServer.run_stdio_async` adds the reply.
 - Bad arguments, unknown tool: JSON-RPC error `-32602` (Invalid params), with a `data` list of
   `{field, reason, type}`. Rejected values are never echoed back to the client. Every problem found
   is listed, not just the first. In lenient mode a bad `customer_id` is reported as a single plain
@@ -203,8 +224,9 @@ clients the server interprets shorthand.
 
 Off by default because it adds a line to stderr for every tool call. Customers without audit
 requirements can leave it off and turn it on only while debugging. When on, every `customer_id`
-produces one line (stderr only, never sent to the client). The raw value is `repr`-escaped and
-truncated to 80 chars, so newlines cannot forge extra log lines:
+produces one line (stderr only, never sent to the client). The raw value is escaped with Python's
+`ascii()` and truncated to 80 chars, so newlines cannot forge extra log lines and a look-alike such as
+`CUſT-00042` (long s) is logged as `'CUſT-00042'` instead of passing for `CUST-00042`:
 
 | Level | Line | Meaning |
 |---|---|---|
@@ -217,3 +239,49 @@ Notes:
 - A call with `customer_id` missing logs no raw value, because the offending "input" would be the whole
   argument object (amount, reason).
 - Other, non-audit INFO lines (startup, per-call summary, `Rejected …`) are unaffected by this flag.
+
+## Design decisions
+
+- **JSON-RPC errors for malformed input, `isError` results for business failures.** A bad argument
+  makes the request itself invalid (protocol level); "customer not found" is a valid call whose tool
+  failed, which the MCP spec models as a result with `isError: true`.
+- **`StrictMCPServer` subclass.** SDK 2.3 turns argument validation failures into `isError` results and
+  drops unparseable lines silently. Two small overrides (`call_tool`, `run_stdio_async`) map both to the
+  standard codes. They rely on SDK internals, which is one reason the SDK is pinned to `>=2.3,<2.4`.
+- **Rejected values are never echoed** to the client, only field names and reasons.
+- **Per-process settings, not per-call arguments**, so a caller (including an LLM) cannot widen its own
+  input rules.
+- **Character rules for `reason`** (it is free text that is stored and echoed back): control characters
+  other than tab and newline, invisible format characters (zero-width characters, bidi overrides),
+  private-use characters, line/paragraph separators and U+FFFD are rejected with `-32602`. Accents,
+  CJK text and emoji are accepted.
+
+## Known issues and limits
+
+- **Encoding: stdin must be UTF-8**, as the MCP stdio transport requires. The SDK decodes stdin with
+  `errors="replace"`, so invalid bytes become U+FFFD. In `reason` that is now rejected
+  (`type: "invalid_encoding"`); in `customer_id` the pattern already rejects it. A whole message in
+  UTF-16, or with a UTF-8 BOM, is answered with `-32700`. The server writes UTF-8 on stdout on every
+  platform (the SDK re-wraps the stream), so Windows code pages do not apply.
+- **`customer_id` accepts ASCII only.** Fullwidth or Arabic-Indic digits and look-alike letters
+  (`CUſT-00042`) are rejected, also in lenient mode (tested).
+- **Unicode is not normalized.** `reason` is stored as sent; two visually identical reasons can differ
+  in code points (for example precomposed `é` versus `e` plus a combining accent). Lengths count code
+  points, so a ZWJ emoji sequence counts as several characters, and ZWJ sequences themselves are
+  rejected (U+200D is a format character).
+- **Extra, undeclared arguments are accepted and ignored**, not rejected.
+- **Data is a fake in-memory store**: refunds reset on restart and nothing is idempotent (the same
+  refund twice is processed twice).
+- **No request size limit on stdin.** The SDK reads a whole line into memory; the client that launches
+  the server is trusted.
+- **A reply is lost if the client closes stdin** while a call is in flight (the server shuts down). For
+  `trigger_refund` the refund may already have been applied; real refunds need idempotency keys.
+- **Log level is fixed at INFO**; only the audit lines have their own switch.
+
+## Dependencies and security
+
+One direct dependency, `mcp>=2.3,<2.4` (locked at 2.3.0 in `uv.lock`, with Pydantic 2.14). The SDK also
+installs its HTTP transport packages (Starlette, uvicorn, `sse-starlette`, `python-multipart`, PyJWT),
+which this stdio-only server never imports. `uv audit` on 2026-11-07: no known vulnerabilities in the
+30 locked packages. Python 3.15 is pinned in `.python-version`; the tests also pass on 3.11 and 3.13.
+Upgrading the SDK is deliberate: bump the range, run `test_stdio.py`, commit.

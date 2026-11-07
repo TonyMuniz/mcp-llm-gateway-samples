@@ -50,6 +50,33 @@ class Session:
     def tool(self, name, args):
         return self.call("tools/call", {"name": name, "arguments": args})
 
+    def raw(self, line: bytes):
+        """Send raw bytes as one line; return the next reply with "id": null (a parse-level error)."""
+        self.proc.stdin.flush()
+        self.proc.stdin.buffer.write(line + b"\n")
+        self.proc.stdin.buffer.flush()
+        while True:
+            out = self.proc.stdout.readline()
+            assert out, "server closed stdout"
+            self.stdout_lines.append(out)
+            msg = json.loads(out)
+            if "id" in msg and msg["id"] is None:
+                return msg
+
+    def raw_tool(self, line: bytes):
+        """Send a hand-built tools/call line (it must use the next id) and return its reply."""
+        self.id += 1
+        self.proc.stdin.flush()
+        self.proc.stdin.buffer.write(line.replace(b'"id": 0', f'"id": {self.id}'.encode()) + b"\n")
+        self.proc.stdin.buffer.flush()
+        while True:
+            out = self.proc.stdout.readline()
+            assert out, "server closed stdout"
+            self.stdout_lines.append(out)
+            msg = json.loads(out)
+            if msg.get("id") == self.id:
+                return msg
+
     def start(self):
         init = self.call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
                                         "clientInfo": {"name": "test", "version": "0"}})
@@ -136,6 +163,48 @@ check("refund unknown customer -> isError result",
 check("unknown tool -> -32602", code(s.tool("no_such_tool", {})) == -32602)
 check("unknown method -> -32601", code(s.call("no/such/method")) == -32601)
 
+# Encoding and character-level edge cases (added in the 2026-11-07 code review).
+good_line = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode()
+unparseable = {
+    "garbage": b"this is not json",
+    "truncated JSON": b'{"jsonrpc":"2.0","id":5,"method":',
+    "UTF-8 BOM before the message": b"\xef\xbb\xbf" + good_line,
+    "UTF-16 encoded line": good_line.decode().encode("utf-16-le"),
+    "lone surrogate escape": b'{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"x\\ud800"}}',
+    "nesting 5000 deep": b'{"jsonrpc":"2.0","id":5,"method":"ping","params":{"a":' + b"[" * 5000 + b"]" * 5000 + b"}}",
+}
+for label, line in unparseable.items():
+    r = s.raw(line)
+    check(f"{label} -> -32700 with id null (used to get no reply at all)", code(r) == -32700, r)
+r = s.raw(b'{"hello": "world"}')
+check("valid JSON that is not JSON-RPC -> -32600 with id null", code(r) == -32600, r)
+check("server still answers after unparseable lines", "result" in s.call("ping"))
+
+bad_reasons = {
+    "NUL": "ok\u0000 reason text here",
+    "ESC": "ok\u001b[31m reason text",
+    "zero-width spaces only": "\u200b" * 12,
+    "RLO bidi override": "refund \u202eesrever text",
+    "line separator U+2028": "ok\u2028 reason text here",
+    "private-use character": "ok\ue000 reason text here",
+    "U+FFFD replacement char": "ok \ufffd reason text here",
+}
+for label, reason in bad_reasons.items():
+    r = s.tool("trigger_refund", {**GOOD_REFUND, "amount": 1.0, "reason": reason})
+    check(f"refund reason with {label} -> -32602", code(r) == -32602, r)
+r = s.raw_tool(b'{"jsonrpc": "2.0", "id": 0, "method": "tools/call", "params": {"name": "trigger_refund", "arguments": '
+               b'{"customer_id": "CUST-00042", "amount": 1.0, "reason": "bad \xff\xfe bytes in here"}}}')
+check("refund reason with invalid UTF-8 bytes -> -32602 invalid_encoding (was silently stored as U+FFFD)",
+      code(r) == -32602 and r["error"]["data"][0]["type"] == "invalid_encoding", r)
+for reason in ("Caf\u00e9 order arrived damaged", "Late delivery \U0001F4E6 again",
+               "Two lines:\n\tbox was crushed"):
+    r = s.tool("trigger_refund", {**GOOD_REFUND, "amount": 1.0, "reason": reason})
+    check(f"refund reason {reason!r} (accents, emoji, tab/newline) is accepted",
+          sc(r).get("reason") == reason.strip(), r)
+for cid in ("CUST-\uff10\uff10\uff10\uff14\uff12", "CUST-\u0660\u0660\u0660\u0664\u0662", "CU\u017fT-00042"):
+    check(f"strict: non-ASCII look-alike id {cid!r} -> -32602",
+          code(s.tool("get_customer_record", {"customer_id": cid})) == -32602)
+
 err = s.finish()
 check("startup line shows lenient_ids=False audit_log=False", "lenient_ids=False audit_log=False" in err, err[:300])
 check("audit off: no audit lines at all", "audit tool=" not in err, err[-400:])
@@ -218,7 +287,10 @@ s = Session(CUSTOMER_MCP_AUDIT_LOG="1")
 s.start()
 s.tool("get_customer_record", {"customer_id": "CUST-00042"})
 s.tool("get_customer_record", {"customer_id": "00042"})
+s.tool("get_customer_record", {"customer_id": "CU\u017fT-00042"})  # long s: looks like CUST-00042
 err = s.finish()
+check("strict+audit: non-ASCII look-alike is logged escaped, so it cannot pass for CUST-00042",
+      "customer_id_rejected raw='CU\\u017fT-00042'" in err and "\u017f" not in err, err[-600:])
 check("strict+audit: canonical id logged", "audit tool=get_customer_record customer_id raw='CUST-00042' lenient=False" in err)
 check("strict+audit: rejected shorthand logged with raw input",
       "customer_id_rejected raw='00042' lenient=False" in err)

@@ -20,6 +20,8 @@ Protocol rules this file follows:
   * stdout carries ONLY JSON-RPC. Nothing here calls print(); all logging goes
     to stderr. (The SDK also diverts fd 1 to stderr while serving, so a stray
     print() from any library cannot corrupt the stream.)
+  * A stdin line that is not JSON -> -32700 (Parse error); JSON that is not a
+    JSON-RPC message -> -32600 (Invalid Request). Both with "id": null.
   * Bad arguments -> JSON-RPC error -32602 (Invalid params), not a tool result.
   * Valid call that fails for business reasons (unknown customer, refund too
     large) -> normal result with isError=true, as the MCP spec recommends.
@@ -36,13 +38,17 @@ import logging
 import os
 import re
 import sys
+import unicodedata
 import uuid
 from typing import Annotated, Any, Union
 
+import anyio
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import MCPError
-from mcp_types import INVALID_PARAMS
+from mcp.shared.message import SessionMessage
+from mcp_types import INVALID_PARAMS, INVALID_REQUEST, PARSE_ERROR, ErrorData, JSONRPCError
 from pydantic import BaseModel, Field, ValidationError
 
 # --------------------------------------------------------------------------
@@ -140,8 +146,10 @@ def _invalid(tool: str, field: str, reason: str, type_: str) -> MCPError:
 
 
 def _safe(raw: object) -> str:
-    """repr() (escapes newlines, so no log injection) truncated to 80 chars."""
-    s = repr(raw)
+    """ascii() truncated to 80 chars. Like repr() it escapes newlines (no log injection), and it
+    also escapes every non-ASCII character, so a look-alike such as 'CU\u017fT-00042' shows up in the
+    log as 'CU\\u017fT-00042' instead of reading as CUST-00042."""
+    s = ascii(raw)
     return s if len(s) <= 80 else s[:77] + "..."
 
 
@@ -211,6 +219,25 @@ RefundReason = Annotated[
         description="Why the refund is being issued (10 to 500 characters).",
     ),
 ]
+
+
+def _reason_problem(reason: str) -> tuple[str, str] | None:
+    """Character-level checks the schema cannot express. Returns (reason, type) or None.
+
+    Rejected: control characters other than tab/newline (NUL, ESC, ...), invisible format
+    characters (zero-width spaces and joiners, bidi overrides that can make text display
+    differently from what is stored), private-use code points, line/paragraph separators,
+    and U+FFFD, which is what invalid UTF-8 on stdin turns into (the SDK decodes stdin with
+    errors="replace"), so mis-encoded input is refused instead of silently stored.
+    """
+    for ch in reason:
+        if ch == "\ufffd":
+            return "contains U+FFFD (the input was probably not valid UTF-8)", "invalid_encoding"
+        if ch not in "\t\n" and unicodedata.category(ch) in ("Cc", "Cf", "Co", "Cs", "Zl", "Zp"):
+            return f"contains a control or invisible character (U+{ord(ch):04X})", "invalid_character"
+    if len(reason.strip()) < 10:  # whitespace-only padding satisfies min_length but carries no information
+        return "must contain at least 10 non-whitespace-padded characters", "string_too_short"
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -293,6 +320,65 @@ class StrictMCPServer(MCPServer):
                 raise MCPError(INVALID_PARAMS, f"Unknown tool: {name}") from exc
             raise
 
+    async def run_stdio_async(self) -> None:
+        """Same as the SDK's, plus a JSON-RPC reply for lines the SDK cannot parse.
+
+        The SDK logs such a line at DEBUG and drops it, so a client waiting for a reply
+        hangs. JSON-RPC 2.0 requires -32700 (invalid JSON) or -32600 (valid JSON that is
+        not a JSON-RPC message), with "id": null. See _ReplyToUnparseable.
+        """
+        async with stdio_server() as (read_stream, write_stream):
+            await self._lowlevel_server.run(
+                _ReplyToUnparseable(read_stream, write_stream),
+                write_stream,
+                self._lowlevel_server.create_initialization_options(),
+            )
+
+
+class _ReplyToUnparseable:
+    """Read-stream wrapper: answers the parse failures the stdio transport passes up as exceptions.
+
+    Covers garbage, truncated JSON, a UTF-8 BOM, UTF-16 text, lone surrogates, very deep
+    nesting and non-JSON-RPC objects. Everything else is passed through unchanged.
+    """
+
+    def __init__(self, inner: Any, write_stream: Any) -> None:
+        self._inner, self._write = inner, write_stream
+
+    def __getattr__(self, name: str) -> Any:  # e.g. last_context, read by the SDK after receive()
+        return getattr(self._inner, name)
+
+    async def receive(self) -> Any:
+        while True:
+            item = await self._inner.receive()
+            if not isinstance(item, Exception):
+                return item
+            invalid_json = isinstance(item, ValidationError) and any(
+                e["type"] in ("json_invalid", "recursion_loop") for e in item.errors(include_url=False))
+            code, message = (PARSE_ERROR, "Parse error") if invalid_json else (INVALID_REQUEST, "Invalid Request")
+            log.info("Rejected an unparseable stdin line with %s", code)
+            await self._write.send(SessionMessage(JSONRPCError(jsonrpc="2.0", id=None,
+                                                               error=ErrorData(code=code, message=message))))
+
+    def __aiter__(self) -> "_ReplyToUnparseable":
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return await self.receive()
+        except anyio.EndOfStream:
+            raise StopAsyncIteration from None
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+    async def __aenter__(self) -> "_ReplyToUnparseable":
+        await self._inner.__aenter__()
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool | None:
+        return await self._inner.__aexit__(*exc)
+
 
 mcp = StrictMCPServer(
     name="customer-mcp",
@@ -314,11 +400,9 @@ def get_customer_record(customer_id: CustomerIdField) -> CustomerRecord:
 @mcp.tool(description="Issue a refund to a customer. Amount must be positive; reason at least 10 characters.")
 def trigger_refund(customer_id: CustomerIdField, amount: RefundAmount, reason: RefundReason) -> RefundReceipt:
     customer_id = resolve_customer_id("trigger_refund", customer_id)
-    # Whitespace-only reasons satisfy min_length but carry no information.
-    if len(reason.strip()) < 10:
+    if problem := _reason_problem(reason):
         raise MCPError(INVALID_PARAMS, "Invalid arguments for tool 'trigger_refund'",
-                       data=[{"field": "reason", "reason": "must contain at least 10 non-whitespace-padded characters",
-                              "type": "string_too_short"}])
+                       data=[{"field": "reason", "reason": problem[0], "type": problem[1]}])
 
     record = _CUSTOMERS.get(customer_id)
     if record is None:
