@@ -173,6 +173,13 @@ class EstimateTests(unittest.TestCase):
                    "max_completion_tokens": 50, "max_tokens": 999}
         self.assertEqual(estimate_tokens(payload, 1024), 16 + 50)
 
+    def test_non_ascii_text_counts_one_token_per_character(self):
+        # 40 CJK characters: chars/4 would say 10 tokens; real tokenizers use about 40 or more.
+        payload = {"messages": [{"role": "user", "content": "\u65e5" * 40}], "max_tokens": 100}
+        self.assertEqual(estimate_tokens(payload, 1024), 40 + 4 + 100)
+        mixed = {"messages": [{"role": "user", "content": "caf\u00e9 " * 8}], "max_tokens": 100}  # 32 ASCII + 8 other
+        self.assertEqual(estimate_tokens(mixed, 1024), 8 + 8 + 4 + 100)
+
 
 if __name__ == "__main__":
     unittest.main()

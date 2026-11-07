@@ -156,6 +156,21 @@ def _retry_after(value: str | None) -> int | None:
         return None
 
 
+async def _read_capped(resp, limit: int | None = None) -> bytes | None:
+    """Read the body, or return None as soon as it exceeds ``limit`` (default MAX_RESPONSE_BYTES).
+    Checking only Content-Length is not enough: a chunked reply has none, and was read whole before."""
+    limit = MAX_RESPONSE_BYTES if limit is None else limit
+    if (resp.content_length or 0) > limit:
+        return None
+    chunks, size = [], 0
+    async for chunk in resp.content.iter_chunked(64 * 1024):
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _total_tokens(body: dict[str, Any]) -> int | None:
     usage = body.get("usage")
     if not isinstance(usage, dict):
@@ -288,9 +303,9 @@ class ModelRouter:
                                               allow_redirects=False) as resp:
                     status = resp.status
                     retry_after = _retry_after(resp.headers.get("Retry-After"))
-                    if (resp.content_length or 0) > MAX_RESPONSE_BYTES:
+                    raw = await _read_capped(resp)
+                    if raw is None:
                         return _Failure("bad_response", True)
-                    raw = await resp.read()
         except TimeoutError:  # asyncio.timeout; aiohttp's own timeouts subclass it too
             return _Failure("timeout", True)
         except (ClientError, OSError) as exc:
@@ -300,9 +315,9 @@ class ModelRouter:
         if status == 200:
             try:
                 parsed = json.loads(raw)
-            except ValueError:
+            except (ValueError, RecursionError):
                 return _Failure("bad_response", True)
-            if not isinstance(parsed, dict) or len(raw) > MAX_RESPONSE_BYTES:
+            if not isinstance(parsed, dict):
                 return _Failure("bad_response", True)
             return RouteResult(parsed, provider.name, _total_tokens(parsed))
         if status == 429:

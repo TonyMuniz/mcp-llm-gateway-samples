@@ -20,6 +20,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -37,6 +38,7 @@ log = logging.getLogger("gateway")
 
 DEMO_KEYS = ("demo-key-1", "demo-key-2")  # replaced by env GATEWAY_API_KEYS="k1,k2"
 PURGE_INTERVAL_S = 30
+BEARER_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")  # RFC 6750 b64token (same rule as Task 2)
 
 
 @dataclass
@@ -88,10 +90,15 @@ async def error_middleware(request: web.Request, handler):
     return response
 
 
+def _reject_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not valid JSON")
+
+
 def _authenticate(request: web.Request, allowed: tuple[str, ...]) -> str:
     scheme, _, token = request.headers.get("Authorization", "").strip().partition(" ")
     token = token.strip()
-    if scheme.lower() == "bearer" and token:
+    # RFC 6750 token characters only: undecodable header bytes used to reach .encode() and give a 500.
+    if scheme.lower() == "bearer" and BEARER_TOKEN.fullmatch(token):
         match = False
         for key in allowed:  # compare against all keys, in constant time per key
             match |= hmac.compare_digest(key.encode(), token.encode())
@@ -102,8 +109,10 @@ def _authenticate(request: web.Request, allowed: tuple[str, ...]) -> str:
 
 def _parse_payload(raw: bytes) -> dict[str, Any]:
     try:
-        payload = json.loads(raw)
-    except ValueError:
+        # NaN/Infinity are not JSON (and would be re-sent to the provider as invalid JSON);
+        # RecursionError is very deep nesting, which used to surface as a 500.
+        payload = json.loads(raw, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):
         raise errors.invalid_request() from None
     if not isinstance(payload, dict) or not isinstance(payload.get("model"), str) \
             or not isinstance(payload.get("messages"), list) or not payload["messages"]:
@@ -215,6 +224,9 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     env_keys = os.environ.get("GATEWAY_API_KEYS")
     keys = tuple(k.strip() for k in env_keys.split(",") if k.strip()) if env_keys else DEMO_KEYS
+    if bad := [k for k in keys if not BEARER_TOKEN.fullmatch(k)]:
+        raise SystemExit(f"GATEWAY_API_KEYS: {len(bad)} key(s) use characters a Bearer token cannot carry "
+                         "(allowed: A-Z a-z 0-9 - . _ ~ + / and trailing =)")
     if not env_keys:
         log.warning("using built-in DEMO api keys; set GATEWAY_API_KEYS for anything real")
     config = Config(

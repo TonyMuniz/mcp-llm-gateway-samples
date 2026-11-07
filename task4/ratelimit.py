@@ -49,21 +49,30 @@ def hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
+def _text_tokens(text: str) -> float:
+    """~4 ASCII characters per token, but one token per non-ASCII character: tokenizers split
+    accented, CJK and emoji text far more finely, so chars/4 would badly underestimate it."""
+    if text.isascii():
+        return len(text) / CHARS_PER_TOKEN
+    non_ascii = sum(1 for ch in text if ord(ch) > 127)
+    return (len(text) - non_ascii) / CHARS_PER_TOKEN + non_ascii
+
+
 def estimate_tokens(payload: dict[str, Any], default_max_tokens: int) -> int:
-    """Upper-bound-ish estimate: prompt (~4 chars per token) plus the completion cap."""
-    chars = 0
+    """Upper-bound-ish estimate: prompt (see ``_text_tokens``) plus the completion cap."""
+    tokens = 0.0
     for message in payload.get("messages") or []:
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, str):
-            chars += len(content)
+            tokens += _text_tokens(content)
         elif isinstance(content, list):  # multi-part content: count the text parts
-            chars += sum(len(p.get("text", "")) for p in content if isinstance(p, dict)
-                         and isinstance(p.get("text"), str))
-        chars += 16  # role and framing overhead
+            tokens += sum(_text_tokens(p["text"]) for p in content if isinstance(p, dict)
+                          and isinstance(p.get("text"), str))
+        tokens += 16 / CHARS_PER_TOKEN  # role and framing overhead
     cap = payload.get("max_completion_tokens") or payload.get("max_tokens")
     if not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0:
         cap = default_max_tokens
-    return math.ceil(chars / CHARS_PER_TOKEN) + cap
+    return math.ceil(tokens) + cap
 
 
 @dataclass(frozen=True)

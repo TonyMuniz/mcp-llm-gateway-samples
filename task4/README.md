@@ -21,7 +21,7 @@ client --Bearer tenant key--> gateway --> primary provider
 ## Run
 
 ```bash
-uv sync
+uv sync                                   # creates .venv from pyproject.toml / uv.lock
 uv run python mock_provider.py --port 9101 --name primary --delay-ms 5000 &   # a primary that hangs
 uv run python mock_provider.py --port 9102 --name secondary &
 uv run python gateway.py --primary http://127.0.0.1:9101 --secondary http://127.0.0.1:9102 &
@@ -36,7 +36,17 @@ Demo keys are `demo-key-1` and `demo-key-2`; set `GATEWAY_API_KEYS="k1,k2"` for 
 `--default-max-tokens`, `--db`, `--breaker-failures` (3), `--breaker-cooldown` (30 s),
 `--breaker-max-cooldown` (300 s), `--primary-health-url` / `--secondary-health-url` (optional probes),
 `--probe-interval`, `--max-inflight` (200); provider keys via `PRIMARY_API_KEY` / `SECONDARY_API_KEY`.
-Tests: `uv run python -m unittest -v test_ratelimit test_gateway test_breaker` (60 tests).
+Tests: `uv run python -m unittest -v test_ratelimit test_gateway test_breaker` (64 tests).
+
+## Assignment requirements
+
+| Requirement | How it is met |
+|---|---|
+| Routing module for completion requests | `router.py` (`ModelRouter`), wired into `gateway.py` at `POST /v1/chat/completions` |
+| Token-aware sliding window, 50,000 tokens/minute per tenant key | `ratelimit.py`: sliding window log with reserve, settle and release (see below) |
+| Fail over to a secondary on 429 or after 3000 ms | One `asyncio.timeout(3.0)` around the whole primary exchange; also fails over on connection errors and 5xx |
+| Standardized error payload, no stack traces or internals | `errors.py` plus one middleware; tested with providers that return stack traces and credentials |
+| On-disk SQLite | WAL-mode SQLite file (`--db`), state survives restarts (tested) |
 
 ## Token-aware sliding-window rate limiter (`ratelimit.py`)
 
@@ -48,7 +58,7 @@ fixed-window boundary.
 
 | Step | What happens |
 |---|---|
-| `reserve` | Estimate = prompt characters / 4 + the request's `max_tokens` (or a default cap). One transaction evicts the key's expired rows, sums the window, and either inserts the estimate or rejects with 429 and a `Retry-After`. |
+| `reserve` | Estimate = prompt characters / 4 (one token per non-ASCII character) + the request's `max_tokens` (or a default cap). One transaction evicts the key's expired rows, sums the window, and either inserts the estimate or rejects with 429 and a `Retry-After`. |
 | `settle` | After success, the row is rewritten to the provider's real `usage.total_tokens` (the estimate if the provider reports none). Over-estimates are refunded immediately. |
 | `release` | If no provider produced an answer (or the handler is cancelled), the row is deleted: failed requests cost nothing. |
 
@@ -148,7 +158,7 @@ Known remaining exposure, not solved here:
 - **Breaker state is per process.** Several gateways each probe a failing provider independently.
 - **Slow clients and TLS** are left to the server in front.
 
-## Standardized errors (`errors.py`, `gateway.py`)
+## Errors (`errors.py`, `gateway.py`)
 
 Every error, whatever its source, is:
 
@@ -158,8 +168,8 @@ Every error, whatever its source, is:
 
 | Situation | Status | `code` |
 |---|---|---|
-| Missing or wrong API key | 401 | `invalid_api_key` |
-| Malformed or incomplete request, or `stream: true` | 400 | `invalid_request`, `streaming_not_supported` |
+| Missing or wrong API key, or a key outside the RFC 6750 token alphabet | 401 | `invalid_api_key` |
+| Malformed or incomplete request (including NaN/Infinity, undecodable bytes, nesting too deep), or `stream: true` | 400 | `invalid_request`, `streaming_not_supported` |
 | Body over 1 MB, or a request larger than the whole token limit | 413 | `request_too_large` |
 | Key over its token limit (`Retry-After` set) | 429 | `rate_limit_exceeded` |
 | Unknown path / wrong method | 404 / 405 | `not_found`, `method_not_allowed` |
@@ -187,15 +197,29 @@ database URL with a password and a GPU hostname, then checks none of it appears.
   about 7,700 concurrent reserves per second (each is a durable SQLite transaction). LLM requests
   are far slower than that, so the limiter is not the bottleneck.
 
-## Design decisions and limits
+## Design decisions
 
 - **Estimate then settle**, because real usage is only known afterwards. The estimate is conservative
   (it includes the full `max_tokens`), so a client that requests `max_tokens: 4000` and uses 50 briefly
   holds 4,000 until settle. Requests without `max_tokens` assume `--default-max-tokens` (1,024).
-- **The 4-characters-per-token heuristic is rough** and only affects the up-front estimate; billing-grade
-  counting needs the provider's tokenizer.
 - **Non-streaming only.** Once a streamed response has started, failing over mid-way is not possible, so
   `stream: true` is rejected with a clear error rather than half-supported.
+- **API keys are validated against the RFC 6750 token alphabet** before any comparison (same rule as
+  Task 2), and `GATEWAY_API_KEYS` entries outside it abort startup.
+- **The request body is re-serialized** (`json.dumps`) before it goes to a provider, so the provider
+  always receives UTF-8 JSON, whatever encoding the client used.
+
+## Known issues and limits
+
+- **Encoding.** Request bodies may be UTF-8 (with or without BOM), UTF-16 or UTF-32 (`json.loads`
+  detects them); a `charset` parameter is ignored, so Latin-1 bytes are a 400. NaN and Infinity are
+  rejected (they are not JSON, and a provider would reject the re-serialized body). Header bytes that
+  are not UTF-8 in `Authorization` are a 401; before the review they caused a 500 with a traceback in
+  the log on every request.
+- **The token estimate is a heuristic.** About 4 ASCII characters per token, one token per non-ASCII
+  character (accented, CJK and emoji text tokenizes far more finely than English). Only message text is
+  counted, not tool definitions or images. It only affects admission: settle replaces it with the
+  provider's reported usage. Billing-grade counting needs the provider's tokenizer.
 - **Breaker state is per process and in memory.** With several gateway processes each learns separately.
   While a circuit is open, one request per cooldown (the trial) can still pay the primary's timeout, unless
   an active probe has already shown it healthy. If all providers are down, a request that wins a
@@ -205,4 +229,15 @@ database URL with a password and a GPU hostname, then checks none of it appears.
 - **A late completion** (a request that outlives the window) is recorded at completion time.
 - **One tenant per key, one limit for all.** Per-tenant limits and a key registry are not included; keys
   come from `GATEWAY_API_KEYS`.
-- **A provider's response is trusted to be JSON** of at most 8 MB; larger or malformed replies count as failures.
+- **A provider's response is trusted to be JSON** of at most 8 MB; larger or malformed replies count as
+  failures. The cap is enforced while reading, so it also holds for chunked replies without a
+  `Content-Length` (before the review those were read whole first).
+- **The provider's success body is passed through as is.** Only errors are rewritten; the content of a
+  200 reply is the provider's (see Task 3 for redacting it).
+
+## Dependencies and security
+
+One direct dependency, `aiohttp>=3.14.5` (the floor is the locked, audited version; the old `>=3.9`
+floor allowed releases with published CVEs if someone installed without the lock file), plus the
+standard library's `sqlite3`. `uv audit` on 2026-11-07: no known vulnerabilities in the 10 locked
+packages. Python 3.15 is pinned in `.python-version`; the tests also pass on 3.11 and 3.13.

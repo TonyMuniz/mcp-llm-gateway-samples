@@ -218,6 +218,52 @@ class FinalErrorTests(GatewayCase):
             self.assertStandardError(status, body, h, want_status, want_code)
         self.assertEqual(self.p_app[mock_provider.CALLS], [])       # none of them reached a provider
 
+    async def test_malformed_and_odd_encodings_are_400_not_500(self):
+        deep = "[" * 100_000 + "]" * 100_000                        # used to be an unhandled RecursionError
+        for raw in ('{"model":"m","messages":' + deep + "}",
+                    '{"model":"m","max_tokens":NaN,"messages":[{"role":"user","content":"hi"}]}',
+                    b"\xff\xfe\x00{"):
+            status, body, h = await self.post(raw=raw)
+            self.assertStandardError(status, body, h, 400, "invalid_request")
+        self.assertEqual(self.p_app[mock_provider.CALLS], [])
+        # A UTF-16 body is valid JSON text, so it is accepted and re-sent to the provider as UTF-8.
+        status, _, _ = await self.post(raw=json.dumps(PAYLOAD).encode("utf-16"))
+        self.assertEqual(status, 200)
+
+    def test_tokens_outside_the_bearer_alphabet_are_401(self):
+        class Req:  # aiohttp hands undecodable header bytes over as surrogate escapes; this was a 500
+            def __init__(self, value):
+                self.headers = {"Authorization": value}
+        for value in ("Bearer \udcff\udcfe", "Bearer k\u00f61", "Bearer k1\x00"):
+            with self.assertRaises(gateway.GatewayError, msg=repr(value)) as ctx:
+                gateway._authenticate(Req(value), ("k1",))
+            self.assertEqual(ctx.exception.code, "invalid_api_key")
+        self.assertEqual(gateway._authenticate(Req("Bearer k1"), ("k1",)), "k1")
+
+    async def test_oversized_chunked_provider_reply_counts_as_a_failure(self):
+        async def chunked(request):  # no Content-Length, so only reading with a cap can catch it
+            resp = aiohttp.web.StreamResponse()
+            resp.enable_chunked_encoding()
+            await resp.prepare(request)
+            for _ in range(4):
+                await resp.write(b" " * 100)
+            await resp.write(b'{"choices": []}')
+            return resp
+        app = aiohttp.web.Application()
+        app.router.add_post("/v1/chat/completions", chunked)
+        big = TestServer(app)
+        await big.start_server()
+        try:
+            async with aiohttp.ClientSession() as session:
+                r = ModelRouter(session, [ProviderConfig("big", self.url(big), timeout_s=2)])
+                with mock.patch("router.MAX_RESPONSE_BYTES", 300):
+                    outcome = await r._attempt(r._providers[0], PAYLOAD)
+                    self.assertEqual(outcome.kind, "bad_response")
+                with mock.patch("router.MAX_RESPONSE_BYTES", 1000):
+                    self.assertEqual((await r._attempt(r._providers[0], PAYLOAD)).provider, "big")
+        finally:
+            await big.close()
+
 
 class RateLimitTests(GatewayCase):
     LIMIT = 250
