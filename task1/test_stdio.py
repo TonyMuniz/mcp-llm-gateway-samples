@@ -161,10 +161,22 @@ for bad in ["0004", "000420", "cust_00042", "00042\n", "abcde", "42", "CUST-", 1
             None, [42]]:
     r = s.tool("get_customer_record", {"customer_id": bad})
     check(f"lenient rejects {bad!r} -> -32602", code(r) == -32602, r)
+    data = r.get("error", {}).get("data", [])
+    check(f"lenient rejection of {bad!r}: ONE plain customer_id entry, no union-branch names",
+          [d.get("field") for d in data] == ["customer_id"] and "constrained" not in json.dumps(data), r)
+r = s.tool("trigger_refund", {**GOOD_REFUND, "customer_id": "42", "amount": "x", "reason": "short"})
+check("lenient: customer_id entry is collapsed while other fields keep their own entries",
+      sorted(d.get("field") for d in r.get("error", {}).get("data", [])) == ["amount", "customer_id", "reason"], r)
 r = s.tool("trigger_refund", {**GOOD_REFUND, "customer_id": 42, "amount": 1.0})
 check("refund with int id -> receipt echoes CUST-00042", sc(r).get("customer_id") == "CUST-00042", r)
 r = s.tool("trigger_refund", {**GOOD_REFUND, "customer_id": "00042", "amount": 1.0})
 check("refund with bare-digit id -> receipt echoes CUST-00042", sc(r).get("customer_id") == "CUST-00042", r)
+r = s.tool("trigger_refund", {**GOOD_REFUND, "customer_id": 42, "amount": 5000.0})
+check("lenient: over-balance refusal names the canonical id CUST-00042",
+      is_err_result(r) and "CUST-00042" in json.dumps(r), r)
+r = s.tool("trigger_refund", {**GOOD_REFUND, "customer_id": "99999", "amount": 1.0})
+check("lenient: closed-account refusal names the canonical id CUST-99999",
+      is_err_result(r) and "CUST-99999" in json.dumps(r), r)
 
 err = s.finish()
 check("startup line shows lenient_ids=True audit_log=False", "lenient_ids=True audit_log=False" in err, err[:300])

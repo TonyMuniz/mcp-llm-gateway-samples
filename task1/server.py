@@ -80,10 +80,24 @@ AUDIT_LOG = _env_flag("CUSTOMER_MCP_AUDIT_LOG")
 # Input types (Pydantic). These become the tool's published JSON Schema AND
 # are enforced at call time. The published schema matches the configured mode.
 # --------------------------------------------------------------------------
+# What may the five X characters in CUST-XXXXX be? ASSUMPTION: digits only.
+# To allow digits AND uppercase letters (e.g. CUST-A1B2C), comment out the first line
+# below and uncomment the second. Nothing else needs to change; everything below is
+# derived from this one line. Re-run test_stdio.py afterwards: it asserts the numeric
+# rules, so some of its "letters are rejected" checks are expected to fail in
+# alphanumeric mode. See README.md ("customer_id: numeric or alphanumeric?").
+_ID_CHARS = "[0-9]"          # numeric XXXXX (default)
+# _ID_CHARS = "[0-9A-Z]"     # alphanumeric XXXXX (digits + uppercase letters)
+
+_ID_CHARS_ANYCASE = _ID_CHARS.replace("A-Z", "A-Za-z")  # lenient mode also ignores case
+_NUMERIC_IDS = _ID_CHARS == "[0-9]"
+_ID_KIND = "digits" if _NUMERIC_IDS else "digits or uppercase letters"
+_ID_BARE = "5-digit" if _NUMERIC_IDS else "5-character"
+
 if LENIENT_IDS:
     _CUSTOMER_ID_DESC = (
         "Customer ID. This server runs in LENIENT mode: besides the canonical CUST-XXXXX "
-        "it accepts a bare 5-digit string (e.g. '00042'), the 'cust-' prefix in any case, "
+        f"it accepts a bare {_ID_BARE} string (e.g. '00042'), the 'cust-' prefix in any case, "
         "or an integer 0..99999 which is zero-padded to 5 digits (42 -> CUST-00042). "
         "The server interprets shorthand, so verify the canonical customer_id in the result."
     )
@@ -91,7 +105,7 @@ if LENIENT_IDS:
         Annotated[
             str,
             Field(
-                pattern=r"^(?:[Cc][Uu][Ss][Tt]-)?[0-9]{5}$",
+                pattern=r"^(?:[Cc][Uu][Ss][Tt]-)?" + _ID_CHARS_ANYCASE + r"{5}$",
                 min_length=5,
                 max_length=10,
                 strict=True,
@@ -102,11 +116,11 @@ if LENIENT_IDS:
         Annotated[int, Field(strict=True, ge=0, le=99999)],
     ]
 else:
-    _CUSTOMER_ID_DESC = "Customer ID in the form CUST-XXXXX (uppercase CUST, 5 digits)."
+    _CUSTOMER_ID_DESC = f"Customer ID in the form CUST-XXXXX (uppercase CUST, 5 {_ID_KIND})."
     CustomerId = Annotated[
         str,
         Field(
-            pattern=r"^CUST-[0-9]{5}$",
+            pattern=r"^CUST-" + _ID_CHARS + r"{5}$",
             min_length=10,
             max_length=10,
             strict=True,
@@ -115,8 +129,8 @@ else:
     ]
 CustomerIdField = Annotated[CustomerId, Field(description=_CUSTOMER_ID_DESC)]
 
-_STRICT_ID = re.compile(r"CUST-[0-9]{5}")
-_LENIENT_ID = re.compile(r"(?:cust-)?([0-9]{5})", re.IGNORECASE)
+_STRICT_ID = re.compile("CUST-" + _ID_CHARS + "{5}")
+_LENIENT_ID = re.compile("(?:cust-)?(" + _ID_CHARS + "{5})", re.IGNORECASE)
 
 
 def _invalid(tool: str, field: str, reason: str, type_: str) -> MCPError:
@@ -169,12 +183,12 @@ def _resolve_customer_id(tool: str, raw: str | int) -> str:
     if LENIENT_IDS:
         m = _LENIENT_ID.fullmatch(raw)  # fullmatch: no trailing-newline loophole
         if m:
-            return f"CUST-{m.group(1)}"
-        raise _invalid(tool, "customer_id", "must be 5 digits, optionally prefixed with 'CUST-' (any case)",
+            return f"CUST-{m.group(1).upper()}"  # canonical form is uppercase
+        raise _invalid(tool, "customer_id", f"must be 5 {_ID_KIND}, optionally prefixed with 'CUST-' (any case)",
                        "customer_id_format")
     if _STRICT_ID.fullmatch(raw):
         return raw
-    raise _invalid(tool, "customer_id", "must match CUST-XXXXX (uppercase, 5 digits)", "customer_id_format")
+    raise _invalid(tool, "customer_id", f"must match CUST-XXXXX (uppercase, 5 {_ID_KIND})", "customer_id_format")
 
 
 RefundAmount = Annotated[
@@ -251,11 +265,21 @@ class StrictMCPServer(MCPServer):
             if isinstance(cause, ValidationError):
                 errors = cause.errors(include_url=False)  # includes the raw "input"
                 # To the client: field + reason only; never echo the rejected value.
-                problems = [
-                    {"field": ".".join(str(p) for p in e["loc"]) or "(root)",
-                     "reason": e["msg"], "type": e["type"]}
-                    for e in errors
-                ]
+                problems = []
+                for e in errors:
+                    if e["loc"][:1] == ("customer_id",) and len(e["loc"]) > 1:
+                        # Lenient mode publishes customer_id as a union (string | integer), so
+                        # Pydantic reports one error per branch ("customer_id.constrained-str",
+                        # "customer_id.constrained-int"). Those are internal names; collapse
+                        # them into one plain entry.
+                        entry = {"field": "customer_id", "type": "customer_id_format",
+                                 "reason": f"must be a {_ID_BARE} id, optionally prefixed with "
+                                           "'CUST-' (any case), or an integer 0 to 99999"}
+                        if entry not in problems:
+                            problems.append(entry)
+                        continue
+                    problems.append({"field": ".".join(str(p) for p in e["loc"]) or "(root)",
+                                     "reason": e["msg"], "type": e["type"]})
                 log.info("Rejected %s: %s", name, [p["field"] for p in problems])
                 if AUDIT_LOG:
                     # To the server log: the raw customer_id. Skip "missing" errors, whose
@@ -311,7 +335,7 @@ def trigger_refund(customer_id: CustomerIdField, amount: RefundAmount, reason: R
 
     refundable = round(record["lifetime_spend"] - record["refunded_to_date"], 2)
     if amount > refundable:
-        raise ToolError(f"Refund {amount:.2f} exceeds refundable balance {refundable:.2f}.")
+        raise ToolError(f"Refund {amount:.2f} for {customer_id} exceeds refundable balance {refundable:.2f}.")
 
     record["refunded_to_date"] = round(record["refunded_to_date"] + amount, 2)
     receipt = RefundReceipt(refund_id=f"RF-{uuid.uuid4().hex[:8].upper()}", customer_id=customer_id,
