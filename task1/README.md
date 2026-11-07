@@ -52,7 +52,7 @@ repeating a refund processes it again. The data lives in `_CUSTOMERS` in `server
 ## Testing with the MCP Inspector
 
 [`@modelcontextprotocol/inspector`](https://github.com/modelcontextprotocol/inspector) needs Node.js.
-Run these from the repository root (so the relative paths below resolve), and **not from inside a
+Run these from the `task1` folder (so the relative paths below resolve), and **not from inside a
 clone of the Inspector repository**: `npx` would then try to run that unbuilt checkout and fail with
 `inspector: not found`.
 
@@ -103,7 +103,7 @@ client launches the server, so the operator sets them in the client's server con
 }
 ```
 
-Replace `/path/to/mcp-llm-gateway-samples/task1` with the absolute path of this repository. Use absolute paths:
+Replace `/path/to/mcp-llm-gateway-samples/task1` with the absolute path of the `task1` folder. Use absolute paths:
 the client starts the server itself and the JSON is not run through a shell. In testing with the MCP
 Inspector, a literal `~/...` in `command` failed with `spawn ~/.../python ENOENT`, while the same
 config with absolute paths connected. Do not rely on `~` or `$HOME` in these fields.
